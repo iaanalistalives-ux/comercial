@@ -581,6 +581,14 @@ display:flex;align-items:center;justify-content:center;font-size:13px;font-weigh
 .tabpane>.secc:first-child{margin-top:4px;}
 .kpi .barra{height:6px;border-radius:4px;background:var(--warm-light);margin-top:auto;overflow:hidden;}
 .kpi .barra i{display:block;height:100%;border-radius:4px;width:0;transition:width .9s cubic-bezier(.2,.8,.2,1);}
+.filtroaviso{display:flex;align-items:center;gap:12px;background:#EAF5F0;border:1px solid #B7E0CE;
+border-radius:var(--r);padding:11px 16px;margin-bottom:14px;font-size:13px;color:#204F42;}
+.filtroaviso .ic{width:26px;height:26px;border-radius:50%;background:var(--sage);color:#fff;flex:none;
+display:flex;align-items:center;justify-content:center;font-size:13px;}
+.filtroaviso div{flex:1;}
+.filtroaviso b{color:var(--sage-dark);}
+.filtroaviso .btn{flex:none;padding:6px 14px;font-size:12.5px;}
+@media(max-width:600px){.filtroaviso{flex-wrap:wrap;}.filtroaviso div{flex:1 1 100%;}}
 .insight{background:var(--card);border-left:4px solid var(--tan);border-radius:0 var(--r) var(--r) 0;
 box-shadow:var(--sh);padding:12px 16px;margin-bottom:16px;font-size:13.5px;}
 .insight b{color:var(--sage-dark);}
@@ -770,6 +778,7 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
     <div class="sm">Arrastra aquí <b>VINCE - PRODUCCIONES ANUALES X TIPO TELA</b> (hoja MATRIZ) y <b>FacturaExpRpt</b>. Puedes soltar los dos juntos.</div>
   </div>
 
+  <div id="avisoFiltro" style="display:none"></div>
   <div id="verdict"></div>
   <div class="kpis" id="kpis"></div>
   <div class="insight" id="insight"></div>
@@ -1095,14 +1104,16 @@ function cumplimiento(){
 }
 
 /* ---------- SERIES ---------- */
-function serieMes(anio,campo){
+function fg(){ return (SEL_G.size && MS_LISTA.length && SEL_G.size!==MS_LISTA.length)? SEL_G : null; }
+function okG(g,sel){ return !sel || sel.has(g); }
+function serieMes(anio,campo,sel){
   const a=Array(12).fill(0);
-  prod().forEach(r=>{ if(yy(r.dt)==anio) a[mm(r.dt)]+= (campo==='v'?r.v:r.q); });
+  prod().forEach(r=>{ if(yy(r.dt)==anio && okG(r.g,sel)) a[mm(r.dt)]+= (campo==='v'?r.v:r.q); });
   return a;
 }
-function ytd(anio,cut){
+function ytd(anio,cut,sel){
   let q=0,v=0; const g=new Set();
-  prod().forEach(r=>{ if(yy(r.dt)==anio && doy(r.dt)<=cut){q+=r.q;v+=r.v;g.add(r.g);} });
+  prod().forEach(r=>{ if(yy(r.dt)==anio && doy(r.dt)<=cut && okG(r.g,sel)){q+=r.q;v+=r.v;g.add(r.g);} });
   return {q,v,p:q?v/q:0,g:g.size,lote:g.size?q/g.size:0};
 }
 function tieneX(){return !!DATA.hasX;}
@@ -1123,9 +1134,10 @@ function planFut(){ // solo meses posteriores al último facturado
   return o;
 }
 function planActivo(A){return PLAN===1 && hayPlan() && A===planAnio() && esParcial(A);}
-function entregas(anio){
+function entregas(anio,sel){
   let tot=0,tarde=0,rep=0,repEnX=0,ngr=new Set(),ngrT=new Set();
   prod().forEach(r=>{ if(anio&&yy(r.dt)!==anio) return;
+    if(!okG(r.g,sel)) return;
     tot+=r.q; ngr.add(r.g);
     if(r.x===1){tarde+=r.q; ngrT.add(r.g); repEnX+=(r.rp||0);}
     rep+=(r.rp||0); });
@@ -1156,28 +1168,39 @@ function sparkline(vals,color){
 }
 
 /* ---------- RENDER ---------- */
+function msSync(A,comp){
+  const todos=grupos(A,comp);
+  MS_LISTA=todos.map(g=>({g:g.g,q:g.q,t:g.t,tarde:g.tarde>0}));
+  const validos=new Set(MS_LISTA.map(x=>x.g));
+  if(!MS_TOCADO){ SEL_G=new Set(validos); }
+  else { [...SEL_G].forEach(g=>{ if(!validos.has(g)) SEL_G.delete(g); }); }
+  msPintar();
+  return todos;
+}
 function render(){
   destroy();
   const AS=anios(), C=corte(), cutDoy=doy(C), curYear=yy(C);
   const comp = ANIO==='COMP';
   const A = comp? curYear : +ANIO;
+  msSync(A,comp);
+  const SEL = fg();
   const esCurso = A===curYear;
   const cut = esCurso? cutDoy : 366;
   const prev = A-1, hayPrev = AS.includes(prev);
   const PL = planActivo(A), fut = PL? planFut() : null;
   const cutEfe = PL? 366 : cut;
-  const curFac = ytd(A,cutEfe);
+  const curFac = ytd(A,cutEfe,SEL);
   const cur = PL? {q:curFac.q+fut.q, v:curFac.v+fut.v,
                    p:(curFac.q+fut.q)?(curFac.v+fut.v)/(curFac.q+fut.q):0,
                    g:curFac.g, lote:curFac.lote} : curFac;
-  const pre = hayPrev? ytd(prev,cutEfe) : null;
+  const pre = (hayPrev && !SEL)? ytd(prev,cutEfe) : null;
 
   document.getElementById('hstate').innerHTML =
     (comp?'Comparativo '+AS.map(y=>etiqAnio(y)).join(' · '):'Año '+etiqAnio(A)) +
     '<br>Datos hasta ' + rangoTxt() + ' ' + yy(C) + ' · última factura ' + dmy(C) +
     (PLAN===1&&hayPlan()? ' · con plan de ventas a DIC':'');
 
-  const cumAll=cumplimiento().filter(o=> comp || yy(o.fprog)===A);
+  const cumAll=cumplimiento().filter(o=> (comp || yy(o.fprog)===A) && okG(o.g,SEL));
   const cum=cumAll.filter(o=>o.venc);
   const progT=cum.reduce((s,o)=>s+o.orden,0), realT=cum.reduce((s,o)=>s+o.desp,0);
   const caidaBruta=cum.filter(o=>o.dif<0).reduce((s,o)=>s-o.dif,0);
@@ -1186,7 +1209,7 @@ function render(){
   const dq = pre&&pre.q? (cur.q-pre.q)/pre.q*100 : null;
   const dv = pre&&pre.v? (cur.v-pre.v)/pre.v*100 : null;
   const dp = pre&&pre.p? (cur.p-pre.p)/pre.p*100 : null;
-  const loteFac = ytd(A,cut).lote;
+  const loteFac = ytd(A,cut,SEL).lote;
   const dl = pre&&pre.lote? (loteFac-pre.lote)/pre.lote*100 : null;
 
   const delta=(d,buenoSube)=> d===null?'':'<span class="d '+(Math.abs(d)<0.5?'flat':(((d>0)===(buenoSube!==false))?'good':'bad'))+'">'+
@@ -1270,15 +1293,28 @@ function render(){
   } else {
     k+='<div class="kpi"><div class="l">Prendas facturadas</div><div class="row"><span class="v">'+n0(cur.q)+'</span>'+delta(dq)+'</div>'+
        '<div class="s">'+subPrev+(pre?': '+n0(pre.q):'')+'</div>'+chip(A)+'<div class="spark">'+
-       sparkline(serieMes(A,'q').map((x,i)=>(esCurso&&i>=mm(C))?null:x),'#0F7A5A')+'</div></div>';
+       sparkline(serieMes(A,'q',SEL).map((x,i)=>(esCurso&&i>=mm(C))?null:x),'#0F7A5A')+'</div></div>';
     k+='<div class="kpi money"><div class="l">Facturación</div><div class="row"><span class="v">'+usd(cur.v)+'</span>'+delta(dv)+'</div>'+
        '<div class="s">'+subPrev+(pre?': '+usd(pre.v):'')+'</div>'+chip(A)+'<div class="spark">'+
-       sparkline(serieMes(A,'v').map((x,i)=>(esCurso&&i>=mm(C))?null:x),'#B45309')+'</div></div>';
+       sparkline(serieMes(A,'v',SEL).map((x,i)=>(esCurso&&i>=mm(C))?null:x),'#B45309')+'</div></div>';
     k+='<div class="kpi'+((dp!==null&&dp<-2)?' warnk':'')+'"><div class="l">Precio promedio por prenda</div><div class="row"><span class="v">$'+n2(cur.p)+'</span>'+delta(dp)+'</div>'+
        '<div class="s">'+subPrev+(pre?': $'+n2(pre.p):'')+'</div>'+chip(A)+'</div>';
     k+='<div class="kpi'+((dl!==null&&dl<-5)?' warnk':'')+'"><div class="l">Lote promedio por grupo</div><div class="row"><span class="v">'+n0(loteFac)+'</span>'+delta(dl)+'</div>'+
-       '<div class="s">'+n0(ytd(A,cut).q)+' prendas en '+curFac.g+' grupos'+(pre?' · '+prev+': '+n0(pre.lote):'')+(PL?' · solo facturado':'')+'</div>'+chipParcial(A)+'</div>';
-    const P=pcp(A), Pp=hayPrev?pcp(prev):null;
+       '<div class="s">'+n0(ytd(A,cut,SEL).q)+' prendas en '+curFac.g+(curFac.g===1?' grupo':' grupos')+(pre?' · '+prev+': '+n0(pre.lote):'')+(PL?' · solo facturado':'')+'</div>'+chipParcial(A)+'</div>';
+    const P=SEL?null:pcp(A), Pp=(hayPrev&&!SEL)?pcp(prev):null;
+    if(SEL && progT>0){
+      const cds=cum.filter(o=>o.dif<0).sort((a,b)=>a.dif-b.dif);
+      const cai=cds.reduce((s,o)=>s-o.dif,0);
+      k+='<div class="kpi'+(pctCum<100?' warnk':'')+'"><div class="l">% de despacho</div>'+
+         '<div class="row"><span class="v">'+n1(pctCum)+'%</span><span class="d neu">'+cum.length+(cum.length===1?' grupo':' grupos')+' con programa</span></div>'+
+         '<div class="s">'+n0(realT)+' despachadas de '+n0(progT)+' ordenadas · base matriz</div>'+barra(pctCum)+'</div>';
+      k+='<div class="kpi'+(cai?' alert':'')+'"><div class="l">Caídas</div>'+
+         '<div class="row"><span class="v">'+n1(cai/progT*100)+'%</span><span class="d neu">'+n0(cai)+' prendas</span></div>'+
+         '<div class="s">base matriz, no PCP</div></div>';
+    } else if(SEL){
+      k+='<div class="kpi sinDato"><div class="l">% de despacho</div><div class="row"><span class="v">—</span></div>'+
+         '<div class="s">Los grupos seleccionados no tienen programa cargado, y la cifra de PCP es anual, no por grupo.</div></div>';
+    }
     if(P){
       const dpp=Pp? (P.pct-Pp.pct) : null;
       k+='<div class="kpi'+(P.pct<99?' warnk':'')+'"><div class="l">% de despacho</div>'+
@@ -1298,7 +1334,7 @@ function render(){
          (det? ' · detalle por grupo disponible para '+det+' grupos':'')+' · fuente PCP</div></div>';
     }
     if(tieneX()){
-      const en=entregas(A), enP=hayPrev?entregas(prev):null;
+      const en=entregas(A,SEL), enP=(hayPrev&&!SEL)?entregas(prev):null;
       const rp=en.rep, rpP=enP?enP.rep:null;
       const drp=(rpP)?((rp-rpP)/rpP*100):null;
       k+='<div class="kpi'+(rp?' alert':'')+'"><div class="l">Reposiciones</div><div class="row"><span class="v">'+(rp?n0(rp):'0')+'</span>'+
@@ -1308,13 +1344,24 @@ function render(){
       k+='<div class="kpi'+(en.pct<100?' warnk':'')+'"><div class="l">Despacho a tiempo</div>'+
          '<div class="row"><span class="v">'+n1(en.pct)+'%</span>'+
          (de===null?'':'<span class="d '+(Math.abs(de)<0.5?'flat':(de>0?'good':'bad'))+'">'+(de>0?'▲':(de<0?'▼':'='))+' '+n1(Math.abs(de))+' pts</span>')+'</div>'+
-         '<div class="s">'+n0(en.ok)+' de '+n0(en.tot)+' prendas sin retraso · '+n0(en.tarde)+' con retraso en '+en.gruposTarde+' grupos'+(PL?' · solo facturado':'')+'</div>'+barra(en.pct)+chipParcial(A)+'</div>';
+         '<div class="s">'+n0(en.ok)+' de '+n0(en.tot)+' prendas sin retraso · '+n0(en.tarde)+' con retraso en '+en.gruposTarde+(en.gruposTarde===1?' grupo':' grupos')+(PL?' · solo facturado':'')+'</div>'+barra(en.pct)+chipParcial(A)+'</div>';
     } else if(progT>0){
       k+='<div class="kpi'+(pctCum<100?' warnk':'')+'"><div class="l">Despacho a tiempo</div><div class="row"><span class="v">'+n1(pctCum)+'%</span></div></div>';
     } else {
       k+='<div class="kpi sinDato"><div class="l">Despacho a tiempo</div><div class="row"><span class="v">—</span></div>'+
          '<div class="s">Falta la columna Retrazo XFTY en la matriz para calcularlo en '+A+'.</div></div>';
     }
+  }
+  const fav=document.getElementById('avisoFiltro');
+  if(fav){
+    if(SEL){
+      const qf=ytd(A,cutEfe,SEL).q;
+      fav.style.display=''; fav.className='filtroaviso';
+      fav.innerHTML='<span class="ic">⛃</span><div><b>Vista filtrada:</b> '+SEL.size+' de '+MS_LISTA.length+
+        ' grupos · '+n0(qf)+' prendas. Las tarjetas y la pestaña Despachos muestran solo esa selección; '+
+        'no se compara contra el año anterior porque los grupos cambian de un año a otro.</div>'+
+        '<button class="btn" onclick="limpiarFiltros()">Ver todos</button>';
+    } else { fav.style.display='none'; fav.innerHTML=''; }
   }
   const cont=document.getElementById('kpis');
   cont.className = comp? 'kpis comp':'kpis';
@@ -1344,6 +1391,8 @@ function render(){
     vs = n0(cur.q)+' prendas y '+usd(cur.v)+' al cierre de '+A+', sumando lo facturado hasta '+MES[ultMes()]+
          ', los pedidos ya colocados y la proyección comercial. Contra '+prev+' completo son '+
          (dq>=0?'+':'')+n1(dq)+'% en prendas y '+(dv>=0?'+':'')+n1(dv)+'% en facturación.'; }
+  const vd=document.getElementById('verdict');
+  if(SEL){ vd.innerHTML=''; } else
   document.getElementById('verdict').innerHTML=
     '<div class="verdict '+vc+'"><div class="dot">'+(vc==='ok'?'✓':'!')+'</div><div><div class="t">'+vt+'</div><div class="s">'+vs+'</div></div></div>';
 
@@ -1361,7 +1410,9 @@ function render(){
     ins+=' La caída no está repartida: <b>'+peor.g+'</b> concentra '+n0(-peor.dif)+' de las '+n0(caidaBruta)+
          ' prendas caídas ('+n1(-peor.dif/caidaBruta*100)+'%). Sin ese grupo, el cumplimiento habría sido '+n1((realT-peor.dif)/progT*100)+'%.';
   }
-  document.getElementById('insight').innerHTML=ins;
+  const ib=document.getElementById('insight');
+  ib.style.display = SEL? 'none':'';
+  ib.innerHTML=ins;
 
   renderResumen(AS,A,comp,C);
   renderEvo(AS,A,comp,C);
@@ -1662,12 +1713,12 @@ function msTodos(v){
   const q=((be&&be.value)||'').trim().toUpperCase();
   const vis=MS_LISTA.filter(x=>!q||x.g.toUpperCase().indexOf(q)>=0||String(x.t).toUpperCase().indexOf(q)>=0);
   vis.forEach(x=>{ v? SEL_G.add(x.g) : SEL_G.delete(x.g); });
-  msPintar(); renderGrupos();
+  msPintar(); render();
 }
 function msMarcar(g){
   MS_TOCADO=true;
   SEL_G.has(g)? SEL_G.delete(g) : SEL_G.add(g);
-  msPintar(); renderGrupos();
+  msPintar(); render();
 }
 function msActivos(){ return (SEL_G.size===MS_LISTA.length)? null : SEL_G; }
 function msPintar(){
@@ -1697,17 +1748,12 @@ function opciones(sel,lista,todos){
 function limpiarFiltros(){
   MS_TOCADO=false; SEL_G=new Set(MS_LISTA.map(x=>x.g));
   ['fTemp','fEstado','msBuscar'].forEach(i=>{const e=document.getElementById(i);if(e)e.value='';});
-  msCerrar(); renderGrupos();
+  msCerrar(); render();
 }
 function renderGrupos(A,comp){
   if(A!==undefined){GRP_A=A;GRP_COMP=comp;}
   A=GRP_A; comp=GRP_COMP;
-  const todos=grupos(A,comp);
-  MS_LISTA=todos.map(g=>({g:g.g,q:g.q,t:g.t,tarde:g.tarde>0}));
-  const validos=new Set(MS_LISTA.map(x=>x.g));
-  if(!MS_TOCADO){ SEL_G=new Set(validos); }
-  else { [...SEL_G].forEach(g=>{ if(!validos.has(g)) SEL_G.delete(g); }); }
-  msPintar();
+  const todos=msSync(A,comp);
   opciones('fTemp',[...new Set(todos.map(g=>g.t))].sort(),'Todas las temporadas');
   const sel=msActivos();
   const ft=(document.getElementById('fTemp')||{}).value||'';
