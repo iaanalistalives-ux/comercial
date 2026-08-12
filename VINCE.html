@@ -1,5 +1,404 @@
 <!DOCTYPE html>
 <html lang="es-PE"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VINCE — Desempeño Comercial | LIVES</title>
@@ -41,9 +440,44 @@ display:flex;align-items:center;gap:16px;padding:0 22px;flex-wrap:wrap;}
 
 .wrap{width:100%;max-width:1440px;margin:0 auto;padding:18px 22px 44px;}
 
+.topsticky{position:sticky;top:0;z-index:16;padding-top:2px;background:var(--warm-light);}
 .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--card);
-border-radius:var(--r);box-shadow:var(--sh);padding:10px 14px;margin-bottom:14px;
-position:sticky;top:0;z-index:15;}
+border-radius:var(--r);box-shadow:var(--sh);padding:10px 14px;margin-bottom:10px;}
+.ms{position:relative;}
+.bar .ms{flex:none;}
+.ms-btn{display:flex;align-items:center;gap:8px;font-family:inherit;font-size:13px;font-weight:700;
+color:#333;background:#fff;border:1px solid var(--warm);border-radius:8px;padding:8px 12px;
+min-width:190px;cursor:pointer;text-align:left;}
+.ms-btn:hover{border-color:var(--sage);}
+.ms.abierto .ms-btn{border-color:var(--sage);box-shadow:0 0 0 3px rgba(15,122,90,.12);}
+.ms-btn #msLabel{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ms-car{color:var(--stone);font-size:11px;}
+.ms.abierto .ms-car{transform:rotate(180deg);}
+.ms-pop{display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:40;width:300px;
+background:#fff;border:1px solid var(--warm);border-radius:var(--r);box-shadow:0 8px 24px rgba(14,59,54,.16);overflow:hidden;}
+.ms.abierto .ms-pop{display:block;}
+.ms-top{padding:10px 12px 8px;}
+.ms-top input{width:100%;font-family:inherit;font-size:13px;padding:8px 10px;
+border:1px solid var(--warm);border-radius:8px;background:var(--warm-light);}
+.ms-top input:focus{outline:none;border-color:var(--sage);background:#fff;}
+.ms-acc{display:flex;gap:14px;padding:0 12px 8px;border-bottom:1px solid var(--warm-light);}
+.ms-acc button{background:none;border:none;font-family:inherit;font-size:11.5px;font-weight:700;
+color:var(--sage);cursor:pointer;padding:0;text-transform:uppercase;letter-spacing:.4px;}
+.ms-acc button:hover{color:var(--sage-dark);text-decoration:underline;}
+.ms-list{max-height:270px;overflow-y:auto;padding:6px 0;}
+.ms-op{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;font-size:13px;}
+.ms-op:hover{background:var(--warm-light);}
+.ms-op input{width:16px;height:16px;accent-color:var(--sage);cursor:pointer;flex:none;}
+.ms-op .g{font-weight:700;flex:1;}
+.ms-op .q{font-size:11.5px;color:var(--stone);font-variant-numeric:tabular-nums;}
+.ms-op .pt2{width:8px;height:8px;border-radius:50%;flex:none;}
+.ms-vacio{padding:14px 12px;font-size:12.5px;color:var(--stone);}
+.ms-pie{display:flex;align-items:center;justify-content:space-between;gap:10px;
+padding:10px 12px;border-top:1px solid var(--warm-light);background:var(--warm-light);}
+.ms-pie span{font-size:11.5px;font-weight:700;color:var(--stone);}
+.ms-pie .btn{padding:6px 14px;font-size:12.5px;}
+@media(max-width:600px){.ms-pop{width:min(88vw,300px);}}
+.bar #fResumen{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}
 .seg{display:inline-flex;background:var(--warm-light);border-radius:8px;padding:3px;gap:2px;}
 .seg button{background:none;border:none;font-family:inherit;font-size:13px;font-weight:700;
 color:var(--stone);padding:6px 14px;border-radius:6px;cursor:pointer;}
@@ -83,7 +517,9 @@ position:relative;overflow:hidden;transition:box-shadow .15s,transform .15s;}
 .d.good{color:var(--sage);background:#E7F4EF;}
 .d.bad{color:var(--rose);background:#FCEBEB;}
 .d.flat{color:var(--stone);background:var(--warm-light);}
-.kpi .s{font-size:11.5px;color:var(--stone);margin-top:3px;}
+.kpi .s{display:none;font-size:11.5px;color:var(--stone);margin-top:3px;}
+.kpi.sinDato .s{display:block;}
+.kpi .barra{margin-top:10px;}
 .kpi .spark{height:26px;margin-top:6px;}
 .kpi .spark svg{display:block;width:100%;height:26px;}
 
@@ -111,6 +547,7 @@ color:var(--taupe);background:#FEF3E2;border:1px solid #F6D9A8;padding:1px 7px;b
 .parc.proy{color:var(--sage);background:#E7F4EF;border-color:#B7E0CE;}
 .parc.big{font-size:11px;padding:2px 10px;margin-left:0;}
 .kpi .parc{margin-left:0;margin-top:6px;}
+.sub2{font-size:10px;color:var(--stone);font-weight:400;}
 .leg{display:inline-flex;align-items:center;gap:5px;margin-left:12px;font-size:11.5px;color:var(--stone);white-space:nowrap;}
 .leg i{width:11px;height:11px;border-radius:3px;display:inline-block;}
 .leg i.dash{width:16px;height:0;border-top:2px dashed var(--tan);border-radius:0;}
@@ -123,7 +560,20 @@ border:1px solid var(--warm);border-radius:8px;padding:8px 10px;min-width:170px;
 .filtros select:focus{outline:none;border-color:var(--sage);}
 .filtros .btn{padding:8px 14px;}
 @media(max-width:600px){.filtros{flex-direction:column;align-items:stretch;}
-.filtros label,.filtros select{width:100%;}}
+.filtros label,.filtros select{width:100%;}
+.topsticky{position:static;}
+.bar #fResumen{display:none;}}
+.secc{display:flex;align-items:flex-start;gap:12px;margin:26px 0 12px;padding:12px 16px;
+background:var(--card);border-radius:var(--r);box-shadow:var(--sh);border-left:5px solid var(--sage);}
+.secc .n{width:26px;height:26px;border-radius:50%;background:var(--sage);color:#fff;flex:none;
+display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;margin-top:1px;}
+.secc .t{font-size:16px;font-weight:700;color:var(--petrol);line-height:1.2;}
+.secc .s{font-size:12.5px;color:var(--stone);margin-top:3px;}
+.secc.alerta{border-left-color:var(--taupe);}
+.secc.alerta .n{background:var(--taupe);}
+.tabpane>.secc:first-child{margin-top:4px;}
+.kpi .barra{height:6px;border-radius:4px;background:var(--warm-light);margin-top:8px;overflow:hidden;}
+.kpi .barra i{display:block;height:100%;border-radius:4px;width:0;transition:width .9s cubic-bezier(.2,.8,.2,1);}
 .insight{background:var(--card);border-left:4px solid var(--tan);border-radius:0 var(--r) var(--r) 0;
 box-shadow:var(--sh);padding:12px 16px;margin-bottom:16px;font-size:13.5px;}
 .insight b{color:var(--sage-dark);}
@@ -255,7 +705,7 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
 }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 
 <div class="header">
   <img src="data:image/png;base64,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" alt="LIVES">
@@ -271,6 +721,7 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
 
   <div class="err" id="err"></div>
 
+  <div class="topsticky">
   <div class="bar no-print">
     <span class="blabel">Período</span>
     <div class="seg" id="segAnio"></div>
@@ -279,11 +730,30 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
       <button class="active" onclick="setPlan(0,this)">Facturado</button>
       <button onclick="setPlan(1,this)">Cierre proyectado</button>
     </div>
+    <span class="blabel" style="margin-left:8px">Grupos</span>
+    <div class="ms" id="msGrupo">
+      <button type="button" class="ms-btn" id="msBtn" onclick="msToggle(event)">
+        <span id="msLabel">Todos los grupos</span><span class="ms-car">▾</span>
+      </button>
+      <div class="ms-pop" id="msPop">
+        <div class="ms-top">
+          <input type="text" id="msBuscar" placeholder="Buscar grupo…" oninput="msPintar()">
+        </div>
+        <div class="ms-acc">
+          <button type="button" onclick="msTodos(1)">Seleccionar todos</button>
+          <button type="button" onclick="msTodos(0)">Ninguno</button>
+        </div>
+        <div class="ms-list" id="msList"></div>
+        <div class="ms-pie"><span id="msPie"></span><button type="button" class="btn primary" onclick="msCerrar()">Listo</button></div>
+      </div>
+    </div>
     <span class="spacer"></span>
+    <span class="blabel" id="fResumen" style="text-transform:none;letter-spacing:0;font-size:11.5px;color:var(--sage-dark);"></span>
     <button class="btn" onclick="document.getElementById('file').click()">Cargar Excel actualizado</button>
     <button class="btn" onclick="exportarObs()" id="btnObs">Exportar para observadores</button>
     <button class="btn primary" onclick="window.print()">Imprimir / PDF</button>
     <input type="file" id="file" multiple="" accept=".xlsx,.xls" style="display:none">
+  </div>
   </div>
 
   <div class="drop no-print solo-interna" id="drop">
@@ -334,35 +804,15 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
     </div>
   </div>
 
-  <!-- 2. CUMPLIMIENTO -->
+  <!-- 2. DESPACHOS -->
   <div class="tabpane">
+
+    <div class="secc"><span class="n">1</span><div><div class="t">Despachos</div>
+      <div class="s">Cuánto salió, en qué grupos y en qué fechas. Filtra la vista completa de esta sección.</div></div></div>
     <div class="grid">
-      <div class="col12"><div class="panel" id="pnlX">
-        <div class="pt">Despacho a tiempo por año</div>
-        <div class="ph">Prendas de las facturas marcadas con X en la columna <b>Retrazo XFTY</b> de la matriz. Retraso ex-fábrica = la prenda salió de planta después de la fecha comprometida.</div>
-        <div id="tblX"></div>
-      </div></div>
-      <div class="col12"><div class="panel" id="pnlProg">
-        <div class="pt">Programado vs. facturado, por grupo</div>
-        <div class="ph" id="phCum">Las filas marcadas PENDIENTE en la matriz son el <b>saldo</b> que le quedaba al grupo, no su pedido completo. Ese saldo se compara contra las facturas emitidas después de esa matriz.</div>
-        <div id="tblCum"></div>
-        <div class="note" id="noteCum"></div>
-      </div></div>
-      <div class="col6"><div class="panel" id="pnlDesv">
-        <div class="pt">Desviación en prendas</div>
-        <div class="ph">Positivo = se facturó más de lo programado. Negativo = caída.</div>
-        <div class="cwrap tall"><canvas id="cDesv"></canvas></div>
-      </div></div>
-      <div class="col6"><div class="panel" id="pnlDias">
-        <div class="pt">Prendas fuera de fecha, por grupo</div>
-        <div class="ph">Se mide cada embarque por separado: las prendas que salieron en o antes de la fecha programada cuentan como puntuales aunque el grupo haya cerrado después con un saldo.</div>
-        <div class="cwrap tall"><canvas id="cDias"></canvas></div>
-      </div></div>
       <div class="col12"><div class="panel">
-        <div class="pt">Despachos por grupo</div>
-        <div class="ph">Un grupo es el lote de producción del cliente. Cada fila resume todo lo que se le despachó a ese grupo en el período seleccionado.</div>
+        <div class="ph" style="margin-top:0">Un grupo es el lote de producción del cliente. Cada fila resume todo lo que se le despachó a ese grupo en el período seleccionado. El selector de grupos está en la barra de arriba.</div>
         <div class="filtros no-print">
-          <label>Grupo <select id="fGrupo" onchange="renderGrupos()"></select></label>
           <label>Temporada <select id="fTemp" onchange="renderGrupos()"></select></label>
           <label>Estado <select id="fEstado" onchange="renderGrupos()">
             <option value="">Todos</option>
@@ -370,22 +820,77 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
             <option value="tarde">Solo con retraso</option>
             <option value="rep">Solo con reposición</option>
           </select></label>
-          <button class="btn" onclick="limpiarFiltros()">Limpiar</button>
+          <button class="btn" onclick="limpiarFiltros()">Limpiar todo</button>
         </div>
         <div id="resGrupo"></div>
         <div id="tblGrupo"></div>
       </div></div>
+    </div>
+
+    <div class="secc"><span class="n">2</span><div><div class="t">Despacho a tiempo</div>
+      <div class="s">Mide <b>fechas</b>: si la mercadería salió de fábrica cuando estaba comprometida. No dice si salió completa.</div></div></div>
+    <div class="grid">
+      <div class="col12"><div class="panel" id="pnlX">
+        <div class="pt">Por año</div>
+        <div class="ph">Prendas de las facturas marcadas con X en la columna <b>Retrazo XFTY</b> de la matriz. Retraso ex-fábrica = la prenda salió de planta después de la fecha comprometida.</div>
+        <div id="tblX"></div>
+      </div></div>
       <div class="col12"><div class="panel">
-        <div class="pt">Despacho a tiempo por grupo</div>
-        <div class="ph">Prendas de cada grupo que salieron en fecha y fuera de fecha. Refleja los filtros de arriba.</div>
+        <div class="pt">Por grupo</div>
+        <div class="ph">Prendas de cada grupo que salieron en fecha y fuera de fecha. Refleja los filtros de la sección 1.</div>
         <div class="cwrap tall"><canvas id="cGrupo"></canvas></div>
       </div></div>
+      <div class="col12"><div class="panel" id="pnlDias">
+        <div class="pt">Días de atraso por grupo programado</div>
+        <div class="ph">Se mide cada embarque por separado: las prendas que salieron en o antes de la fecha comprometida cuentan como puntuales aunque el grupo haya cerrado después con un saldo.</div>
+        <div class="cwrap tall"><canvas id="cDias"></canvas></div>
+      </div></div>
+    </div>
+
+    <div class="secc alerta" id="pnlSecCaidas"><span class="n">3</span><div><div class="t">Caídas a detalle</div>
+      <div class="s">Mide <b>cantidades</b>: cuánto se despachó de lo ordenado. Solo existe para los grupos con programa cargado en la matriz.</div></div></div>
+    <div id="avisoCaidas"></div>
+    <div class="grid" id="gridCaidas">
+      <div class="col12"><div class="panel" id="pnlPcp">
+        <div class="pt">Pedido contra exportado, por año</div>
+        <div class="ph">Cifras del reporte de <b>PCP</b>. <b>Pedido</b> = cantidad que ordenó el cliente. <b>Exportadas</b> = prendas efectivamente embarcadas. Es la única fuente que cubre los tres años completos.</div>
+        <div id="tblPcp"></div>
+      </div></div>
+      <div class="col12"><div class="panel" id="pnlCaiKpi">
+        <div class="pt">Detalle por grupo — solo 2026</div>
+        <div class="ph">A partir de aquí el dato sale de la matriz de Nidia, no de PCP. La <b>orden estimada</b> se reconstruye del programa cargado, así que cubre 11 grupos y no coincide exactamente con el total anual de PCP.</div>
+        <div id="resCaida"></div>
+      </div></div>
+      <div class="col7"><div class="panel" id="pnlCaiBar">
+        <div class="pt">Ordenado contra despachado, por grupo</div>
+        <div class="ph">Barra clara = prendas ordenadas. Barra sólida = prendas despachadas. La franja roja es la caída.
+          <span class="leg"><i style="background:#0F7A5A"></i>Despachado completo</span>
+          <span class="leg"><i style="background:#DC2626"></i>Caída</span></div>
+        <div class="cwrap tall"><canvas id="cCaida"></canvas></div>
+      </div></div>
+      <div class="col5"><div class="panel" id="pnlCaiMix">
+        <div class="pt">Dónde se concentró la caída</div>
+        <div class="ph">Prendas caídas repartidas por estilo y grupo.</div>
+        <div class="cwrap tall"><canvas id="cCaiMix"></canvas></div>
+      </div></div>
       <div class="col12"><div class="panel" id="pnlCaida">
-        <div class="pt">¿La caída fue por cantidad o por estilo?</div>
+        <div class="pt">Caída por estilo</div>
         <div class="ph">Caída en prendas atribuida al estilo del grupo que no cumplió.</div>
         <div id="tblEstiloCaida"></div>
       </div></div>
+      <div class="col12"><div class="panel" id="pnlProg">
+        <div class="pt">Detalle: orden estimada contra despacho, grupo por grupo</div>
+        <div class="ph" id="phCum">Las filas marcadas PENDIENTE en la matriz son el saldo que le quedaba al grupo cuando se armó ese archivo. <b>Orden estimada</b> = lo que el grupo ya había despachado en ese momento, más ese saldo. <b>Caída</b> = prendas ordenadas que no llegaron a despacharse.</div>
+        <div id="tblCum"></div>
+        <div class="note" id="noteCum"></div>
+      </div></div>
+      <div class="col12"><div class="panel" id="pnlDesv">
+        <div class="pt">Desviación en prendas</div>
+        <div class="ph">Positivo = se despachó más de lo ordenado. Negativo = caída.</div>
+        <div class="cwrap tall"><canvas id="cDesv"></canvas></div>
+      </div></div>
     </div>
+
   </div>
 
   <!-- 3. MIX Y PRECIOS -->
@@ -457,7 +962,9 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
     <p><b>Puntualidad:</b> se mide <b>embarque por embarque</b>, no por grupo. Las prendas de cada factura con fecha igual o anterior a la fecha programada cuentan como puntuales; solo las prendas de las facturas posteriores cuentan como fuera de fecha. Así, si un grupo embarcó el grueso en fecha y después salió un saldo, se penaliza únicamente ese saldo y no el grupo entero.</p>
     <p><b>Días de atraso:</b> días entre la fecha programada y la última factura del grupo. Solo se muestra en los grupos que tienen prendas fuera de fecha.</p>
     <p><b>Despacho a tiempo:</b> prendas despachadas sin marca de retraso, divididas entre el total de prendas despachadas del período. La marca sale de la columna <b>Retrazo XFTY</b> de la matriz: una X significa que esa factura salió de fábrica después de la fecha comprometida, y entonces todas sus prendas cuentan como fuera de fecha. Al no depender de un programa cargado, el indicador existe para los tres años.</p>
-    <p><b>Lo que este indicador NO dice:</b> mide si la mercadería salió a tiempo, no si salió completa. Para saber cuánto se despachó de lo que el cliente ordenó haría falta la cantidad del PO, que no está en ninguno de los archivos. Por eso el tablero no habla de cumplimiento de cantidades.</p>
+    <p><b>Lo que este indicador NO dice:</b> mide si la mercadería salió a tiempo, no si salió completa. Para eso está el % de despacho, que es otra cosa.</p>
+    <p><b>% de despacho y caídas:</b> prendas despachadas divididas entre prendas ordenadas, por grupo. La cantidad ordenada se reconstruye sumando lo que el grupo ya había despachado cuando se armó la matriz más el saldo marcado <b>PENDIENTE</b> en ella. En 9 de los 11 grupos medibles ese saldo era la orden entera, porque no se había despachado nada todavía. <b>Es una orden estimada, no la orden de compra del cliente:</b> si el cliente cambió cantidades después de que se armó la matriz, no queda registrado. Solo existe para los grupos con fila PENDIENTE, que son 11 de 2026 y ninguno de 2024 ni 2025.</p>
+    <p><b>Caída:</b> prendas que estaban programadas y no llegaron a despacharse. La <b>caída bruta</b> suma solo los grupos que quedaron cortos; la <b>neta</b> compensa con los que despacharon de más. Se muestran las dos porque la neta esconde el problema real.</p>
     <p><b>Retraso ex-fábrica (XFTY):</b> la mercadería salió de planta después de la fecha pactada con el cliente. No significa que faltaran prendas, sino que llegaron tarde.</p>
     <p><b>Reposiciones:</b> prendas que el cliente volvió a pedir después de haber rechazado un lote, aceptando incluso segundas. Van como indicador aparte porque no son producción nueva: son la reparación de un problema de calidad.</p>
     <p><b>Segundas:</b> prendas con un defecto menor que el cliente acepta igual, normalmente a menor precio.</p>
@@ -471,7 +978,7 @@ body.observador .bar button[onclick*="file"]{display:none!important;}
 
 <script>const MODO_OBSERVADOR=true;</script>
 <script>
-const DATA = /*<<D>>*/{"fac":[{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-06","doc":"E001-005429","q":6,"v":145.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-06","doc":"E001-005249","q":6,"v":145.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-27","doc":"E001-005504","q":403,"v":9772.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-537","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-08-16","doc":"E001-005685","q":4071,"v":98721.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":83125,"d":"CAMI TANK","f":"BABY RIB 50/1","dt":"2024-11-09","doc":"E001-005976","q":1003,"v":8726.1,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2024-11-09","doc":"E001-005976","q":2436,"v":35322,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":3031,"v":43949.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":83125,"d":"CAMI TANK","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":1801,"v":15668.7,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":4397,"v":63756.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84667,"d":"S/S SIDE TIE DRESS","f":"50/1 INTERLOCK","dt":"2024-12-19","doc":"E001-006097","q":2727,"v":66196.87,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2024-12-19","doc":"E001-006097","q":6906,"v":93576.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-17","doc":"E001-006210","q":4,"v":112.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-28","doc":"E001-006247","q":188,"v":2641.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-28","doc":"E001-006248","q":1060,"v":14893,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-31","doc":"E001-006263","q":1556,"v":21861.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006372","q":120,"v":1614,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84551,"d":"RIBBED SWEET HEART NK TANK","f":"HEAVY RIB","dt":"2025-03-10","doc":"E001-006370","q":4070,"v":52096,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006387","q":55,"v":814,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006389","q":160,"v":2368,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006388","q":313,"v":4632.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006398","q":2213,"v":32752.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-03-10","doc":"E001-006370","q":2321,"v":33654.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006370","q":5523,"v":66276,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006370","q":6796,"v":91406.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-17","doc":"E001-006400","q":950,"v":13490,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-17","doc":"E001-006400","q":4118,"v":68976.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-21","doc":"E001-006414","q":52,"v":738.4,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-22","doc":"E001-006418","q":9288,"v":131889.6,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-25","doc":"E001-006431","q":30,"v":502.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-26","doc":"E001-006437","q":3799,"v":63633.25,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-04-03","doc":"E001-006463","q":30,"v":502.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-04-04","doc":"E001-006469","q":3814,"v":63884.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-548","t":"PRE FALL 25 MAIN LINE","e":84759,"d":"RAGLAN COLOR BLOCK TEE","f":"BABY PIMA","dt":"2025-05-02","doc":"E001-006568","q":146,"v":1927.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-548","t":"PRE FALL 25 MAIN LINE","e":84759,"d":"RAGLAN COLOR BLOCK TEE","f":"BABY PIMA","dt":"2025-05-03","doc":"E001-006576","q":2857,"v":37712.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-05-07","doc":"E001-006584","q":103,"v":1462.6,"tp":"P","s":0,"x":1,"rp":103,"hx":1},{"g":"VIN-552","t":"PRE FALL 25 MAIN LINE","e":84781,"d":"RIB STRIPED LS CREW","f":"STRIPE SOFT VARIGATED","dt":"2025-05-14","doc":"E001-006616","q":2,"v":90.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-552","t":"PRE FALL 25 MAIN LINE","e":84781,"d":"RIB STRIPED LS CREW","f":"STRIPE SOFT VARIGATED","dt":"2025-05-31","doc":"E001-006663","q":681,"v":15424.65,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-11","doc":"E001-006692","q":63,"v":1241.1,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84857,"d":"RIB MIDI SKIRT","f":"HEAVY RIB","dt":"2025-06-11","doc":"E001-006692","q":49,"v":1538.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-12","doc":"E001-006703","q":3459,"v":68142.3,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-13","doc":"E001-006704","q":2,"v":61.84,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84857,"d":"RIB MIDI SKIRT","f":"HEAVY RIB","dt":"2025-06-12","doc":"E001-006703","q":1499,"v":47068.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-25","doc":"E001-006743","q":4352,"v":85734.4,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-06-27","doc":"E001-006752","q":2,"v":68,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006753","q":360,"v":5184,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006754","q":427,"v":6148.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006757","q":163,"v":2347.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-07-01","doc":"E001-006759","q":6295,"v":90648,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006829","q":54,"v":1150.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006830","q":2424,"v":53799.45,"tp":"P","s":0,"x":0,"rp":716,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006828","q":1012,"v":20678.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006842","q":813,"v":13333.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006844","q":24,"v":393.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006845","q":30,"v":492,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006843","q":541,"v":8872.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-29","doc":"E001-007021","q":80,"v":1184,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-29","doc":"E001-007022","q":104,"v":1539.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-09-30","doc":"E001-007023","q":209,"v":3009.6,"tp":"P","s":0,"x":1,"rp":209,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-30","doc":"E001-007023","q":1647,"v":24375.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-558","t":"PRE SPRING 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-10-29","doc":"E001-007094","q":55,"v":792,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-29","doc":"E001-007094","q":25,"v":370,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007094","q":70,"v":1494.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007094","q":503,"v":6966.55,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-29","doc":"E001-007095","q":47,"v":695.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007095","q":71,"v":1515.85,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007095","q":180,"v":2493,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007098","q":420,"v":8967,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007098","q":360,"v":4986,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-558","t":"PRE SPRING 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-10-29","doc":"E001-007099","q":4912,"v":70732.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007099","q":1215,"v":16827.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-31","doc":"E001-007103","q":528,"v":7814.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-31","doc":"E001-007103","q":1491,"v":31832.85,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-31","doc":"E001-007103","q":818,"v":11329.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-11-04","doc":"E001-007114","q":3,"v":107.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-18","doc":"E001-007141","q":4,"v":112,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007164","q":750,"v":14625,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007164","q":750,"v":17250,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007164","q":420,"v":10164,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007161","q":203,"v":3693.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007161","q":65,"v":1495,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007161","q":37,"v":895.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007162","q":77,"v":1369,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007162","q":65,"v":1495,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007162","q":30,"v":726,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-28","doc":"E001-007187","q":3142,"v":57459,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-28","doc":"E001-007187","q":1265,"v":29095,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-28","doc":"E001-007187","q":1453,"v":35162.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007287","q":450,"v":5670,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":80,"v":1008,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":84,"v":1058.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":50,"v":630,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007291","q":110,"v":1386,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007291","q":482,"v":6073.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":787,"v":9916.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":3047,"v":38392.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":746,"v":9399.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2026-01-15","doc":"E001-007329","q":13304,"v":166300,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-569","t":"SUMMER 26 MFO","e":84667,"d":"S/S SIDE TIE DRESS","f":"50/1 INTERLOCK","dt":"2026-01-15","doc":"E001-007329","q":817,"v":19526.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-570","t":"SUMMER 26 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2026-01-15","doc":"E001-007329","q":4539,"v":64408.41,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-15","doc":"E001-007329","q":943,"v":11881.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007364","q":191,"v":3027.35,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007366","q":156,"v":2472.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007365","q":92,"v":1159.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007367","q":236,"v":2973.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-26","doc":"E001-007370","q":800,"v":10080,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-26","doc":"E001-007371","q":1167,"v":14704.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2026-01-30","doc":"E001-007397","q":3544,"v":42350.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-569","t":"SUMMER 26 MFO","e":84662,"d":"S/S POLO DRESS","f":"50/1 INTERLOCK","dt":"2026-01-30","doc":"E001-007397","q":2387,"v":59675,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-30","doc":"E001-007397","q":1031,"v":16341.35,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-575","t":"SUMMER 26 MFO","e":84972,"d":"SOLID RINGER TEE","f":"BABY PIMA","dt":"2026-01-30","doc":"E001-007397","q":1804,"v":26428.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-18","doc":"E001-007459","q":111,"v":2775,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-18","doc":"E001-007458","q":28,"v":700,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-576","t":"SUMMER 26 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2026-02-19","doc":"E001-007462","q":9617,"v":120212.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-19","doc":"E001-007462","q":517,"v":12925,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-03","doc":"E001-007506","q":30,"v":378,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-03","doc":"E001-007507","q":467,"v":5884.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-577","t":"PRE FALL 26 MFO","e":84970,"d":"S/S POLO","f":"SOFT COTTON RIB","dt":"2026-03-05","doc":"E001-007514","q":6355,"v":88016.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-05","doc":"E001-007514","q":503,"v":6337.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2026-03-16","doc":"E001-007539","q":105,"v":1254.75,"tp":"P","s":0,"x":1,"rp":105,"hx":1},{"g":"VIN-577","t":"PRE FALL 26 MFO","e":84979,"d":"3/4 SLV HENLEY","f":"SOFT COTTON RIB","dt":"2026-03-30","doc":"E001-007583","q":1984,"v":28768,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-570","t":"SUMMER 26 MFO","e":84675,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2026-04-20","doc":"E001-007622","q":589,"v":8357.91,"tp":"P","s":0,"x":1,"rp":589,"hx":1},{"g":"VIN-575","t":"SUMMER 26 MFO","e":84972,"d":"SOLID RINGER TEE","f":"BABY PIMA","dt":"2026-04-20","doc":"E001-007622","q":211,"v":3091.15,"tp":"P","s":0,"x":1,"rp":211,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007654","q":75,"v":1372.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007655","q":180,"v":3241.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007655","q":226,"v":2847.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007656","q":46,"v":841.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-07","doc":"E001-007673","q":3287,"v":59300.55,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-11","doc":"E001-007680","q":204,"v":2570.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-12","doc":"E001-007682","q":75,"v":945,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-12","doc":"E001-007682","q":760,"v":9576,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-12","doc":"E001-007681","q":29,"v":365.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-580","t":"FALL 26 MFO","e":85025,"d":"CAMI","f":"SOFT COTTON RIB","dt":"2026-05-13","doc":"E001-007683","q":1632,"v":15014.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-13","doc":"E001-007683","q":1394,"v":17564.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-13","doc":"E001-007683","q":951,"v":11982.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-581","t":"FALL 26 MFO","e":84489,"d":"STRIPED LS CREW","f":"SOFT COTTON RIB STRIPE","dt":"2026-05-16","doc":"E001-007691","q":2946,"v":55090.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-09","doc":"E001-007753","q":406,"v":5604.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-09","doc":"E001-007754","q":221,"v":3006.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-10","doc":"E001-007755","q":799,"v":10067.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007766","q":121,"v":1887.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-589","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007766","q":700,"v":8820,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007767","q":42,"v":655.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-23","doc":"E001-007795","q":901,"v":14055.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-01","doc":"E001-007827","q":80,"v":1248,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007844","q":800,"v":12480,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-589","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007844","q":512,"v":6451.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007843","q":825,"v":11526,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007897","q":1852,"v":27526.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007895","q":210,"v":3276,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007896","q":362,"v":5221.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-13","doc":"E001-007537","q":1,"v":25.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-587M","t":"(SIN DATO)","e":0,"d":"MUESTRA","f":"(SIN DATO)","dt":"2026-05-05","doc":"E001-007661","q":35,"v":1220.1,"tp":"M","s":1,"x":0,"rp":0,"hx":1}],"prog":[],"corte":"2026-07-20","hasX":true,"plan":{"y":2026,"m":[{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":1500,"v":27825,"qc":1500,"qp":0,"vc":27825,"vp":0},{"q":8850,"v":121460,"qc":8850,"qp":0,"vc":121460,"vp":0},{"q":2100,"v":26460,"qc":2100,"qp":0,"vc":26460,"vp":0},{"q":900,"v":11340,"qc":900,"qp":0,"vc":11340,"vp":0},{"q":16140,"v":245232,"qc":5640,"qp":10500,"vc":93132,"vp":152100}],"facQ":4641,"facV":1012593.42}}/*<<F>>*/;
+const DATA = /*<<D>>*/{"fac":[{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-06","doc":"E001-005429","q":6,"v":145.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-06","doc":"E001-005249","q":6,"v":145.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-536","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-06-27","doc":"E001-005504","q":403,"v":9772.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-537","t":"NORD ANNIVERSARY 2024","e":84275,"d":"SIDE DRAPE TANK DRESS","f":"50/1 INTERLOCK","dt":"2024-08-16","doc":"E001-005685","q":4071,"v":98721.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":83125,"d":"CAMI TANK","f":"BABY RIB 50/1","dt":"2024-11-09","doc":"E001-005976","q":1003,"v":8726.1,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2024-11-09","doc":"E001-005976","q":2436,"v":35322,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":3031,"v":43949.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":83125,"d":"CAMI TANK","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":1801,"v":15668.7,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2024-12-19","doc":"E001-006097","q":4397,"v":63756.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84667,"d":"S/S SIDE TIE DRESS","f":"50/1 INTERLOCK","dt":"2024-12-19","doc":"E001-006097","q":2727,"v":66196.87,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-538","t":"SUMMER 2025 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2024-12-19","doc":"E001-006097","q":6906,"v":93576.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-17","doc":"E001-006210","q":4,"v":112.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-28","doc":"E001-006247","q":188,"v":2641.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-28","doc":"E001-006248","q":1060,"v":14893,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-543","t":"SPRING 25 MAIN LINE","e":84681,"d":"RIB ELBOW SLEEVE CREW NK","f":"SOFT VARIGATD RIB","dt":"2025-01-31","doc":"E001-006263","q":1556,"v":21861.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006372","q":120,"v":1614,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84551,"d":"RIBBED SWEET HEART NK TANK","f":"HEAVY RIB","dt":"2025-03-10","doc":"E001-006370","q":4070,"v":52096,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006387","q":55,"v":814,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006389","q":160,"v":2368,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006388","q":313,"v":4632.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-544","t":"SUMMER 2025 MAIN LINE","e":84727,"d":"MIXED MEDIA HENLEY","f":"SOFT VARIGATD RIB","dt":"2025-03-14","doc":"E001-006398","q":2213,"v":32752.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-03-10","doc":"E001-006370","q":2321,"v":33654.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006370","q":5523,"v":66276,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2025-03-10","doc":"E001-006370","q":6796,"v":91406.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-17","doc":"E001-006400","q":950,"v":13490,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-17","doc":"E001-006400","q":4118,"v":68976.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-21","doc":"E001-006414","q":52,"v":738.4,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-03-22","doc":"E001-006418","q":9288,"v":131889.6,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-25","doc":"E001-006431","q":30,"v":502.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-03-26","doc":"E001-006437","q":3799,"v":63633.25,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-04-03","doc":"E001-006463","q":30,"v":502.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-542","t":"PRE FALL 25 MFO","e":84746,"d":"RIBBED SS CREW","f":"HEAVY RIB","dt":"2025-04-04","doc":"E001-006469","q":3814,"v":63884.5,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-548","t":"PRE FALL 25 MAIN LINE","e":84759,"d":"RAGLAN COLOR BLOCK TEE","f":"BABY PIMA","dt":"2025-05-02","doc":"E001-006568","q":146,"v":1927.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-548","t":"PRE FALL 25 MAIN LINE","e":84759,"d":"RAGLAN COLOR BLOCK TEE","f":"BABY PIMA","dt":"2025-05-03","doc":"E001-006576","q":2857,"v":37712.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-540","t":"PRE FALL 25 MFO","e":84670,"d":"ELBOW SLEVE POLO","f":"BABY RIB 50/1","dt":"2025-05-07","doc":"E001-006584","q":103,"v":1462.6,"tp":"P","s":0,"x":1,"rp":103,"hx":1},{"g":"VIN-552","t":"PRE FALL 25 MAIN LINE","e":84781,"d":"RIB STRIPED LS CREW","f":"STRIPE SOFT VARIGATED","dt":"2025-05-14","doc":"E001-006616","q":2,"v":90.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-552","t":"PRE FALL 25 MAIN LINE","e":84781,"d":"RIB STRIPED LS CREW","f":"STRIPE SOFT VARIGATED","dt":"2025-05-31","doc":"E001-006663","q":681,"v":15424.65,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-11","doc":"E001-006692","q":63,"v":1241.1,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84857,"d":"RIB MIDI SKIRT","f":"HEAVY RIB","dt":"2025-06-11","doc":"E001-006692","q":49,"v":1538.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-12","doc":"E001-006703","q":3459,"v":68142.3,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-13","doc":"E001-006704","q":2,"v":61.84,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84857,"d":"RIB MIDI SKIRT","f":"HEAVY RIB","dt":"2025-06-12","doc":"E001-006703","q":1499,"v":47068.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-549","t":"FALL 25 MFO","e":84856,"d":"RIB L/S CREW","f":"HEAVY RIB","dt":"2025-06-25","doc":"E001-006743","q":4352,"v":85734.4,"tp":"P","s":0,"x":1,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-06-27","doc":"E001-006752","q":2,"v":68,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006753","q":360,"v":5184,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006754","q":427,"v":6148.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-06-30","doc":"E001-006757","q":163,"v":2347.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-07-01","doc":"E001-006759","q":6295,"v":90648,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006829","q":54,"v":1150.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006830","q":2424,"v":53799.45,"tp":"P","s":0,"x":0,"rp":716,"hx":1},{"g":"VIN-555","t":"FALL 25 MAIN LINE","e":84799,"d":"STRIPED LS CREW","f":"DOUBLE STRIPE SOFT VARIGATED","dt":"2025-07-24","doc":"E001-006828","q":1012,"v":20678.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006842","q":813,"v":13333.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006844","q":24,"v":393.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006845","q":30,"v":492,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-556","t":"FALL 25 MAIN LINE","e":84832,"d":"RUFFLED EDGE LS CREW","f":"SOFT VARIGATD RIB","dt":"2025-07-29","doc":"E001-006843","q":541,"v":8872.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-29","doc":"E001-007021","q":80,"v":1184,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-29","doc":"E001-007022","q":104,"v":1539.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-554","t":"FALL 25 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-09-30","doc":"E001-007023","q":209,"v":3009.6,"tp":"P","s":0,"x":1,"rp":209,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-09-30","doc":"E001-007023","q":1647,"v":24375.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-558","t":"PRE SPRING 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-10-29","doc":"E001-007094","q":55,"v":792,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-29","doc":"E001-007094","q":25,"v":370,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007094","q":70,"v":1494.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007094","q":503,"v":6966.55,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-29","doc":"E001-007095","q":47,"v":695.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007095","q":71,"v":1515.85,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007095","q":180,"v":2493,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-29","doc":"E001-007098","q":420,"v":8967,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007098","q":360,"v":4986,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-558","t":"PRE SPRING 25 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2025-10-29","doc":"E001-007099","q":4912,"v":70732.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-29","doc":"E001-007099","q":1215,"v":16827.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-561","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-10-31","doc":"E001-007103","q":528,"v":7814.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-562","t":"PRE SPRING 25 MAIN LINE","e":84880,"d":"STRIPE L/S","f":"30/1 70/30 PIMA MODAL STRIPE","dt":"2025-10-31","doc":"E001-007103","q":1491,"v":31832.85,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-565","t":"PRE SPRING 25 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-10-31","doc":"E001-007103","q":818,"v":11329.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-559","t":"PRE SPRING 25 MAIN LINE","e":84502,"d":"RIB L/S CREW","f":"SOFT VARIGATD RIB","dt":"2025-11-04","doc":"E001-007114","q":3,"v":107.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-18","doc":"E001-007141","q":4,"v":112,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007164","q":750,"v":14625,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007164","q":750,"v":17250,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007164","q":420,"v":10164,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007161","q":203,"v":3693.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007161","q":65,"v":1495,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007161","q":37,"v":895.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007162","q":77,"v":1369,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-25","doc":"E001-007162","q":65,"v":1495,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-25","doc":"E001-007162","q":30,"v":726,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-563","t":"PRE SPRING 25 MAIN LINE","e":84850,"d":"HEATHER TIPPED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-28","doc":"E001-007187","q":3142,"v":57459,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-566","t":"PRE SPRING26 MAIN LINE","e":84872,"d":"STRIPED EASY LS POLO","f":"SOFT STRUCTURED COTTON STRIPE","dt":"2025-11-28","doc":"E001-007187","q":1265,"v":29095,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-567","t":"PRE SPRING 25 MAIN LINE","e":84865,"d":"PRINTED LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2025-11-28","doc":"E001-007187","q":1453,"v":35162.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007287","q":450,"v":5670,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":80,"v":1008,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":84,"v":1058.4,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007290","q":50,"v":630,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007291","q":110,"v":1386,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007291","q":482,"v":6073.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-572","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":787,"v":9916.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":3047,"v":38392.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-574","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2025-12-31","doc":"E001-007289","q":746,"v":9399.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2026-01-15","doc":"E001-007329","q":13304,"v":166300,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-569","t":"SUMMER 26 MFO","e":84667,"d":"S/S SIDE TIE DRESS","f":"50/1 INTERLOCK","dt":"2026-01-15","doc":"E001-007329","q":817,"v":19526.3,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-570","t":"SUMMER 26 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2026-01-15","doc":"E001-007329","q":4539,"v":64408.41,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-15","doc":"E001-007329","q":943,"v":11881.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007364","q":191,"v":3027.35,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007366","q":156,"v":2472.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007365","q":92,"v":1159.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-23","doc":"E001-007367","q":236,"v":2973.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-26","doc":"E001-007370","q":800,"v":10080,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-26","doc":"E001-007371","q":1167,"v":14704.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2026-01-30","doc":"E001-007397","q":3544,"v":42350.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-569","t":"SUMMER 26 MFO","e":84662,"d":"S/S POLO DRESS","f":"50/1 INTERLOCK","dt":"2026-01-30","doc":"E001-007397","q":2387,"v":59675,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-573","t":"SPRING 26 MAIN LINE","e":84886,"d":"HIGH V NECK SHELL","f":"30/1 70/30 PIMA MODAL","dt":"2026-01-30","doc":"E001-007397","q":1031,"v":16341.35,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-575","t":"SUMMER 26 MFO","e":84972,"d":"SOLID RINGER TEE","f":"BABY PIMA","dt":"2026-01-30","doc":"E001-007397","q":1804,"v":26428.6,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-18","doc":"E001-007459","q":111,"v":2775,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-18","doc":"E001-007458","q":28,"v":700,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-576","t":"SUMMER 26 MFO","e":84738,"d":"WIDE SLV CROP TEE","f":"50/1 INTERLOCK","dt":"2026-02-19","doc":"E001-007462","q":9617,"v":120212.5,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-578","t":"SUMMER 26 MAIN LINE","e":84937,"d":"RIB ELBOW SLV HENLEY","f":"SOFT VARIGATD RIB","dt":"2026-02-19","doc":"E001-007462","q":517,"v":12925,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-03","doc":"E001-007506","q":30,"v":378,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-03","doc":"E001-007507","q":467,"v":5884.2,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-577","t":"PRE FALL 26 MFO","e":84970,"d":"S/S POLO","f":"SOFT COTTON RIB","dt":"2026-03-05","doc":"E001-007514","q":6355,"v":88016.75,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-579","t":"SPRING 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-05","doc":"E001-007514","q":503,"v":6337.8,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-568","t":"SUMMER 26 MFO","e":84537,"d":"EASY SHELL","f":"50/1 INTERLOCK","dt":"2026-03-16","doc":"E001-007539","q":105,"v":1254.75,"tp":"P","s":0,"x":1,"rp":105,"hx":1},{"g":"VIN-577","t":"PRE FALL 26 MFO","e":84979,"d":"3/4 SLV HENLEY","f":"SOFT COTTON RIB","dt":"2026-03-30","doc":"E001-007583","q":1984,"v":28768,"tp":"P","s":0,"x":0,"rp":0,"hx":1},{"g":"VIN-570","t":"SUMMER 26 MFO","e":84675,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2026-04-20","doc":"E001-007622","q":589,"v":8357.91,"tp":"P","s":1,"x":1,"rp":589,"hx":1},{"g":"VIN-575","t":"SUMMER 26 MFO","e":84972,"d":"SOLID RINGER TEE","f":"BABY PIMA","dt":"2026-04-20","doc":"E001-007622","q":211,"v":3091.15,"tp":"P","s":1,"x":1,"rp":211,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007654","q":75,"v":1372.5,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007655","q":180,"v":3241.5,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007655","q":226,"v":2847.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-04","doc":"E001-007656","q":46,"v":841.8,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-07","doc":"E001-007673","q":3287,"v":59300.55,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-11","doc":"E001-007680","q":204,"v":2570.4,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-12","doc":"E001-007682","q":75,"v":945,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-12","doc":"E001-007682","q":760,"v":9576,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-12","doc":"E001-007681","q":29,"v":365.4,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-580","t":"FALL 26 MFO","e":85025,"d":"CAMI","f":"SOFT COTTON RIB","dt":"2026-05-13","doc":"E001-007683","q":1632,"v":15014.4,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-13","doc":"E001-007683","q":1394,"v":17564.4,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-13","doc":"E001-007683","q":951,"v":11982.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-581","t":"FALL 26 MFO","e":84489,"d":"STRIPED LS CREW","f":"SOFT COTTON RIB STRIPE","dt":"2026-05-16","doc":"E001-007691","q":2946,"v":55090.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-09","doc":"E001-007753","q":406,"v":5604.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-09","doc":"E001-007754","q":221,"v":3006.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-10","doc":"E001-007755","q":799,"v":10067.4,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007766","q":121,"v":1887.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-589","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007766","q":700,"v":8820,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-12","doc":"E001-007767","q":42,"v":655.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-23","doc":"E001-007795","q":901,"v":14055.6,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-01","doc":"E001-007827","q":80,"v":1248,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007844","q":800,"v":12480,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-589","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007844","q":512,"v":6451.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-02","doc":"E001-007843","q":825,"v":11526,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007897","q":1852,"v":27526.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007895","q":210,"v":3276,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"ESSSENTIAL LS CREW","f":"30/1 70/30 PIMA MODAL","dt":"2026-07-20","doc":"E001-007896","q":362,"v":5221.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-03-13","doc":"E001-007537","q":1,"v":25.2,"tp":"P","s":1,"x":0,"rp":0,"hx":1},{"g":"VIN-587M","t":"(SIN DATO)","e":0,"d":"MUESTRA","f":"(SIN DATO)","dt":"2026-05-05","doc":"E001-007661","q":35,"v":1220.1,"tp":"M","s":1,"x":0,"rp":0,"hx":1}],"prog":[{"g":"VIN-570","t":"SUMMER 26 MFO","e":84672,"d":"ELBOW SLV HENLEY","f":"BABY RIB 50/1","dt":"2026-04-20","q":626,"v":8882.94},{"g":"VIN-575","t":"SUMMER 26 MFO","e":84972,"d":"SOLID RINGER TEE","f":"BABY PIMA","dt":"2026-04-20","q":196,"v":2871.4},{"g":"VIN-580","t":"FALL 26 MFO","e":85025,"d":"CAMI","f":"SOFT COTTON RIB","dt":"2026-05-05","q":1600,"v":15840},{"g":"VIN-581","t":"FALL 26 MFO","e":84489,"d":"STRIPED LS CREW","f":"SOFT COTTON RIB STRIPE","dt":"2026-05-16","q":3000,"v":58050},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84933,"d":"STRIPE CAMI","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-07","q":950,"v":16387.5},{"g":"VIN-583","t":"PRE FALL 26 MAIN LINE","e":84938,"d":"STRIPE SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-07","q":2600,"v":47580},{"g":"VIN-584","t":"PRE FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-05-05","q":1800,"v":22680},{"g":"VIN-585","t":"PRE FALL 26 MAIN LINE","e":84500,"d":"RIB SHELL","f":"SOFT VARIGATD RIB","dt":"2026-05-12","q":2300,"v":28980},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-10","q":600,"v":7560},{"g":"VIN-586","t":"FALL 26 MAIN LINE","e":84798,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-10","q":1600,"v":26160},{"g":"VIN-588","t":"FALL 26 MAIN LINE","e":84798,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-18","q":1950,"v":31882.5},{"g":"VIN-589","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-26","q":1200,"v":15120},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84798,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-30","q":1800,"v":29430},{"g":"VIN-590","t":"FALL 26 MAIN LINE","e":84679,"d":"SHRUNKEN 90S TEE","f":"30/1 70/30 PIMA MODAL","dt":"2026-06-30","q":600,"v":7560},{"g":"VIN-591","t":"PRE SPRING 26 MFO","e":85058,"d":"STRIPED ELBOW SLV","f":"SOFT COTTON RIB STRIPE","dt":"2026-08-21","q":1500,"v":27825}],"corte":"2026-07-20","hasX":true,"plan":{"y":2026,"m":[{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":0,"v":0,"qc":0,"qp":0,"vc":0,"vp":0},{"q":1500,"v":27825,"qc":1500,"qp":0,"vc":27825,"vp":0},{"q":8850,"v":121460,"qc":8850,"qp":0,"vc":121460,"vp":0},{"q":2100,"v":26460,"qc":2100,"qp":0,"vc":26460,"vp":0},{"q":900,"v":11340,"qc":900,"qp":0,"vc":11340,"vp":0},{"q":16140,"v":245232,"qc":5640,"qp":10500,"vc":93132,"vp":152100}],"facQ":4641,"facV":1012593.42},"pcp":{"2024":{"ped":27220,"exp":26796},"2025":{"ped":102761,"exp":101911},"2026":{"ped":69987,"exp":67926},"fuente":"PCP"}}/*<<F>>*/;
 const HTML_BASE = '<!DOCTYPE html>\n'+document.documentElement.outerHTML;
 const OBS = (typeof MODO_OBSERVADOR!=='undefined') && MODO_OBSERVADOR;
 const MES=['ENE','FEB','MAR','ABR','MAY','JUN','JUL','AGO','SET','OCT','NOV','DIC'];
@@ -551,6 +1058,7 @@ function cumplimiento(){
     if(p.dt>o.fprog)o.fprog=p.dt;
     o.est[p.e]=(o.est[p.e]||0)+p.q; o.dsc=o.dsc||{}; o.dsc[p.e]=p.d;
   });
+  prod().forEach(r=>{ if(byG[r.g] && r.s===0){const o=byG[r.g]; o.antes=(o.antes||0)+r.q;} });
   prod().forEach(r=>{ if(byG[r.g] && r.s===1){const o=byG[r.g]; o.real=(o.real||0)+r.q; o.realV=(o.realV||0)+r.v;
     o.nfac=o.nfac||new Set(); o.nfac.add(r.doc);
     o.env=o.env||[]; o.env.push(r);
@@ -561,9 +1069,12 @@ function cumplimiento(){
     o.desc=(o.dsc&&o.dsc[o.e])?o.dsc[o.e]:'';
     o.estLbl = o.nEst>1 ? (o.nEst+' estilos ('+ce.map(x=>x[0]).join(', ')+')') : (o.e+' '+o.desc);
     o.real=o.real||0; o.realV=o.realV||0; o.nfac=o.nfac?o.nfac.size:0;
+    o.antes=o.antes||0;
+    o.orden=o.prog+o.antes;      /* orden estimada del grupo */
+    o.desp=o.antes+o.real;       /* todo lo despachado del grupo */
     o.venc = o.fprog<=C;
-    o.dif=o.real-o.prog;
-    o.pct=o.prog?o.real/o.prog:0;
+    o.dif=o.desp-o.orden;
+    o.pct=o.orden?o.desp/o.orden:0;
     o.dias = (o.ffin&&o.venc) ? Math.round((new Date(o.ffin)-new Date(o.fprog))/86400000) : null;
     o.env=o.env||[];
     o.qOk = o.env.filter(r=>r.dt<=o.fprog).reduce((s,r)=>s+r.q,0);
@@ -586,6 +1097,12 @@ function ytd(anio,cut){
   return {q,v,p:q?v/q:0,g:g.size,lote:g.size?q/g.size:0};
 }
 function tieneX(){return !!DATA.hasX;}
+function pcp(y){ const p=DATA.pcp&&DATA.pcp[String(y)]; if(!p||!p.ped) return null;
+  return {ped:p.ped, exp:p.exp, pct:p.exp/p.ped*100, caida:p.ped-p.exp}; }
+function pcpTot(años){ let ped=0,exp=0;
+  (años||[]).forEach(y=>{const p=pcp(y); if(p){ped+=p.ped;exp+=p.exp;}});
+  return ped? {ped:ped,exp:exp,pct:exp/ped*100,caida:ped-exp} : null; }
+function tienePcp(){ return !!(DATA.pcp && Object.keys(DATA.pcp).some(k=>/^\d{4}$/.test(k))); }
 function hayPlan(){return !!(DATA.plan && DATA.plan.m && DATA.plan.m.some(x=>x.q>0||x.v>0));}
 function planAnio(){return hayPlan()?DATA.plan.y:null;}
 function planFut(){ // solo meses posteriores al último facturado
@@ -612,6 +1129,12 @@ function agg(filtro,campo){
   return o;
 }
 
+function barra(pct){
+  if(pct===null||pct===undefined) return '';
+  const p=Math.max(0,Math.min(100,pct));
+  const c = p>=99.5?'#0F7A5A':(p>=95?'#F59E0B':'#DC2626');
+  return '<div class="barra"><i style="background:'+c+'" data-w="'+p.toFixed(1)+'"></i></div>';
+}
 function sparkline(vals,color){
   const v=vals.filter(x=>x!==null); if(v.length<2) return '';
   const mx=Math.max(...v,1), mn=Math.min(...v,0), rg=(mx-mn)||1;
@@ -647,7 +1170,7 @@ function render(){
 
   const cumAll=cumplimiento().filter(o=> comp || yy(o.fprog)===A);
   const cum=cumAll.filter(o=>o.venc);
-  const progT=cum.reduce((s,o)=>s+o.prog,0), realT=cum.reduce((s,o)=>s+o.real,0);
+  const progT=cum.reduce((s,o)=>s+o.orden,0), realT=cum.reduce((s,o)=>s+o.desp,0);
   const caidaBruta=cum.filter(o=>o.dif<0).reduce((s,o)=>s-o.dif,0);
   const pctCum=progT? realT/progT*100 : null;
 
@@ -694,6 +1217,22 @@ function render(){
     k+='<div class="kpi"><div class="l">Precio promedio por prenda</div>'+porAnio(v=>'$'+n2(v),'p')+'</div>';
     k+='<div class="kpi"><div class="l">Lote promedio por grupo</div>'+porAnio(n0,'lote',1)+'</div>';
     k+='<div class="kpi warnk"><div class="l">Grupos facturados</div>'+porAnio(n0,'g',1)+'</div>';
+    if(tienePcp()){
+      k+='<div class="kpi warnk"><div class="l">% de despacho</div>'+
+         '<div class="yy">'+AS.map((y,i)=>{const P=pcp(y),Pa=i>0?pcp(AS[i-1]):null;
+           const dd=(P&&Pa)?(P.pct-Pa.pct):null;
+           return '<div class="yyr"><span class="yl">'+y+(esParcial(y)?'<i>parcial</i>':'')+'</span>'+
+                  '<span class="yv">'+(P?n1(P.pct)+'%':'—')+'</span>'+
+                  '<span class="yd '+(dd===null?'nul':(Math.abs(dd)<0.1?'flat':(dd>0?'good':'bad')))+'">'+
+                  (dd===null?(P?n0(P.ped)+' ped.':'—'):((dd>0?'▲':'▼')+' '+n1(Math.abs(dd))+' pts'))+'</span></div>';
+         }).join('')+'</div></div>';
+      k+='<div class="kpi alert"><div class="l">Caídas</div>'+
+         '<div class="yy">'+AS.map(y=>{const P=pcp(y);
+           return '<div class="yyr"><span class="yl">'+y+(esParcial(y)?'<i>parcial</i>':'')+'</span>'+
+                  '<span class="yv">'+(P?n1(P.caida/P.ped*100)+'%':'—')+'</span>'+
+                  '<span class="yd nul">'+(P?n0(P.caida)+' prendas':'sin dato')+'</span></div>';
+         }).join('')+'</div></div>';
+    }
     if(tieneX()){
       k+='<div class="kpi alert"><div class="l">Reposiciones</div>'+
          '<div class="yy">'+AS.map(y=>{const e=entregas(y);
@@ -730,6 +1269,25 @@ function render(){
        '<div class="s">'+subPrev+(pre?': $'+n2(pre.p):'')+'</div>'+chip(A)+'</div>';
     k+='<div class="kpi'+((dl!==null&&dl<-5)?' warnk':'')+'"><div class="l">Lote promedio por grupo</div><div class="row"><span class="v">'+n0(loteFac)+'</span>'+delta(dl)+'</div>'+
        '<div class="s">'+n0(ytd(A,cut).q)+' prendas en '+curFac.g+' grupos'+(pre?' · '+prev+': '+n0(pre.lote):'')+(PL?' · solo facturado':'')+'</div>'+chipParcial(A)+'</div>';
+    const P=pcp(A), Pp=hayPrev?pcp(prev):null;
+    if(P){
+      const dpp=Pp? (P.pct-Pp.pct) : null;
+      k+='<div class="kpi'+(P.pct<99?' warnk':'')+'"><div class="l">% de despacho</div>'+
+         '<div class="row"><span class="v">'+n1(P.pct)+'%</span>'+
+         (dpp===null?'':'<span class="d '+(Math.abs(dpp)<0.1?'flat':(dpp>0?'good':'bad'))+'">'+
+           (dpp>0?'▲':(dpp<0?'▼':'='))+' '+n1(Math.abs(dpp))+' pts</span>')+'</div>'+
+         '<div class="s">'+n0(P.exp)+' exportadas de '+n0(P.ped)+' pedidas · fuente PCP</div>'+
+         barra(P.pct)+'</div>';
+      const det = progT>0? cum.filter(o=>o.dif<0).length : 0;
+      const dcai = Pp? ((P.caida/P.ped*100)-(Pp.caida/Pp.ped*100)) : null;
+      k+='<div class="kpi'+(P.caida?' alert':'')+'"><div class="l">Caídas</div>'+
+         '<div class="row"><span class="v">'+n1(P.caida/P.ped*100)+'%</span>'+
+         '<span class="d '+(P.caida?'bad':'good')+'">'+n0(P.caida)+' prendas</span>'+
+         (dcai===null?'':'<span class="d '+(Math.abs(dcai)<0.05?'flat':(dcai<0?'good':'bad'))+'">'+
+           (dcai>0?'▲':(dcai<0?'▼':'='))+' '+n1(Math.abs(dcai))+' pts</span>')+'</div>'+
+         '<div class="s">prendas pedidas que no se exportaron'+
+         (det? ' · detalle por grupo disponible para '+det+' grupos':'')+' · fuente PCP</div></div>';
+    }
     if(tieneX()){
       const en=entregas(A), enP=hayPrev?entregas(prev):null;
       const rp=en.rep, rpP=enP?enP.rep:null;
@@ -741,7 +1299,7 @@ function render(){
       k+='<div class="kpi'+(en.pct<100?' warnk':'')+'"><div class="l">Despacho a tiempo</div>'+
          '<div class="row"><span class="v">'+n1(en.pct)+'%</span>'+
          (de===null?'':'<span class="d '+(Math.abs(de)<0.5?'flat':(de>0?'good':'bad'))+'">'+(de>0?'▲':(de<0?'▼':'='))+' '+n1(Math.abs(de))+' pts</span>')+'</div>'+
-         '<div class="s">'+n0(en.ok)+' de '+n0(en.tot)+' prendas sin retraso · '+n0(en.tarde)+' con retraso en '+en.gruposTarde+' grupos'+(PL?' · solo facturado':'')+'</div>'+chipParcial(A)+'</div>';
+         '<div class="s">'+n0(en.ok)+' de '+n0(en.tot)+' prendas sin retraso · '+n0(en.tarde)+' con retraso en '+en.gruposTarde+' grupos'+(PL?' · solo facturado':'')+'</div>'+barra(en.pct)+chipParcial(A)+'</div>';
     } else if(progT>0){
       k+='<div class="kpi'+(pctCum<100?' warnk':'')+'"><div class="l">Despacho a tiempo</div><div class="row"><span class="v">'+n1(pctCum)+'%</span></div></div>';
     } else {
@@ -752,6 +1310,7 @@ function render(){
   const cont=document.getElementById('kpis');
   cont.className = comp? 'kpis comp':'kpis';
   cont.innerHTML=k;
+  setTimeout(()=>document.querySelectorAll('.kpi .barra i').forEach(b=>b.style.width=b.dataset.w+'%'),80);
 
   /* Veredicto */
   let vc='ok',vt='',vs='';
@@ -798,6 +1357,7 @@ function render(){
   renderResumen(AS,A,comp,C);
   renderEvo(AS,A,comp,C);
   renderCum(cumAll,cum,progT,realT,caidaBruta);
+  renderPcp(AS,C);
   renderX(AS,C);
   renderGrupos(A,comp);
   renderMix(A,comp,AS);
@@ -873,17 +1433,104 @@ function renderEvo(AS,A,comp,C){
 }
 
 /* ---- TAB 2: CUMPLIMIENTO ---- */
+function renderPcp(AS,C){
+  const pn=document.getElementById('pnlPcp');
+  if(!tienePcp()){ if(pn) pn.style.display='none'; return; }
+  if(pn) pn.style.display='';
+  let h='<table><thead><tr><th>Año</th><th class="num">Pedido</th><th class="num">Exportadas</th>'+
+        '<th class="num">Caída</th><th class="num">% de despacho</th></tr></thead><tbody>';
+  let TP=0,TE=0;
+  AS.forEach(y=>{ const p=pcp(y); if(!p){
+      h+='<tr><td><b>'+etiqAnio(y)+'</b></td><td colspan="4" style="color:var(--stone)">sin dato de PCP</td></tr>'; return; }
+    TP+=p.ped; TE+=p.exp;
+    const cls=p.pct>=99?'ok':(p.pct>=97?'warn':'bad');
+    h+='<tr><td><b>'+etiqAnio(y)+'</b></td><td class="num">'+n0(p.ped)+'</td><td class="num">'+n0(p.exp)+'</td>'+
+       '<td class="num" style="color:'+(p.caida?'var(--rose)':'inherit')+'">'+(p.caida?n0(p.caida):'—')+'</td>'+
+       '<td class="num"><span class="pill '+cls+'">'+n1(p.pct)+'%</span></td></tr>';
+  });
+  h+='</tbody><tfoot><tr><td>TOTAL</td><td class="num">'+n0(TP)+'</td><td class="num">'+n0(TE)+'</td>'+
+     '<td class="num">'+n0(TP-TE)+'</td><td class="num">'+n1(TP?TE/TP*100:0)+'%</td></tr></tfoot></table>';
+  const dif=AS.map(y=>{const p=pcp(y); const mio=serieMes(y,'q').reduce((a,b)=>a+b,0);
+      return p? {y:y,d:mio-p.exp}:null;}).filter(Boolean);
+  const dt=dif.reduce((s,x)=>s+x.d,0);
+  h+='<div class="note"><b>Contraste con la facturación de exportación.</b> El total de PCP y el del tablero difieren en '+
+     n0(Math.abs(dt))+' prendas sobre '+n0(TE)+', es decir '+n1(Math.abs(dt)/TE*100)+'%. '+
+     'Por año la diferencia es mayor ('+dif.map(x=>x.y+': '+(x.d>0?'+':'')+n0(x.d)).join(' · ')+
+     ') porque PCP corta por fecha de salida de fábrica y el tablero por fecha de facturación: '+
+     'lo que sale de planta a fin de año y se factura en enero cae en años distintos. Falta el detalle por grupo de PCP para cuadrarlo.</div>';
+  document.getElementById('tblPcp').innerHTML=h;
+}
+
 function renderCum(all,cum,progT,realT,caidaBruta){
-  const hay=DATA.prog&&DATA.prog.length;
-  ['pnlProg','pnlDesv','pnlDias','pnlCaida'].forEach(i=>{const e=document.getElementById(i);if(e)e.style.display=hay?'':'none';});
-  if(!hay) return;
+  const hay = all && all.length;
+  ['pnlProg','pnlDesv','pnlDias','pnlCaida','pnlCaiKpi','pnlCaiBar','pnlCaiMix'].forEach(i=>{
+    const e=document.getElementById(i); if(e) e.style.display=hay?'':'none';});
+  const av=document.getElementById('avisoCaidas');
+  if(av) av.style.display=hay?'none':'';
+  if(!hay){
+    if(av) av.innerHTML='<div class="panel"><div class="pt">Sin detalle por grupo para este período</div>'+
+      '<div class="ph" style="margin-bottom:0">El total anual de pedido contra exportado sí está arriba, con la cifra de PCP. '+
+      'Lo que falta es el desglose por grupo: la matriz de Nidia solo tiene programa cargado para 11 grupos de 2026. '+
+      'Con el mismo cuadro de PCP abierto por grupo, esta sección funcionaría en los tres años.</div></div>';
+    return;
+  }
+
+  /* --- tarjetas de la sección de caídas --- */
+  const v0=all.filter(o=>o.venc);
+  const caidos0=v0.filter(o=>o.dif<0).sort((a,b)=>a.dif-b.dif);
+  const excede=v0.filter(o=>o.dif>0).reduce((s,o)=>s+o.dif,0);
+  const pend=all.filter(o=>!o.venc).reduce((s,o)=>s+o.prog,0);
+  const pctD=progT? realT/progT*100 : 0;
+  const peor=caidos0[0];
+  document.getElementById('resCaida').innerHTML=
+    '<div class="big3">'+
+    '<div class="b3" style="background:'+(pctD>=99.5?'#E7F4EF':'#FEF3E2')+'"><div class="l">% de despacho</div>'+
+      '<div class="v" style="color:'+(pctD>=99.5?'var(--sage)':'var(--taupe)')+'">'+n1(pctD)+'%</div>'+
+      '<div class="s">'+n0(realT)+' despachadas de '+n0(progT)+' ordenadas</div>'+
+      '<div class="barra" style="margin-top:8px"><i style="background:'+(pctD>=99.5?'#0F7A5A':'#F59E0B')+'" data-w="'+pctD.toFixed(1)+'"></i></div></div>'+
+    '<div class="b3"><div class="l">Caída bruta</div><div class="v" style="color:var(--rose)">'+n1(caidaBruta/progT*100)+'%</div>'+
+      '<div class="s">'+n0(caidaBruta)+' prendas no despachadas de '+n0(progT)+' ordenadas</div></div>'+
+    '<div class="b3"><div class="l">Grupos con caída</div><div class="v">'+caidos0.length+'<span style="font-size:16px;color:var(--stone)"> de '+v0.length+'</span></div>'+
+      '<div class="s">'+(peor? peor.g+' concentra el '+n1(-peor.dif/caidaBruta*100)+'%' : 'sin caídas en el período')+'</div></div>'+
+    '<div class="b3"><div class="l">Despachado de más</div><div class="v" style="color:var(--sage)">'+n0(excede)+'</div>'+
+      '<div class="s">prendas sobre lo ordenado'+(pend? ' · '+n0(pend)+' aún no vencen':'')+'</div></div>'+
+    '</div>';
+  setTimeout(()=>document.querySelectorAll('#resCaida .barra i').forEach(b=>b.style.width=b.dataset.w+'%'),80);
+
+  /* --- ordenado vs despachado --- */
+  const ord=v0.slice().sort((a,b)=>a.pct-b.pct);
+  try{CH.cai&&CH.cai.destroy();}catch(e){}
+  CH.cai=new Chart(document.getElementById('cCaida'),{type:'bar',
+    data:{labels:ord.map(o=>o.g+'  '+n1(o.pct*100)+'%'),datasets:[
+      {label:'Despachado',data:ord.map(o=>Math.min(o.desp,o.orden)),backgroundColor:'#0F7A5A',stack:'a',borderRadius:{topLeft:0,bottomLeft:0}},
+      {label:'Caída',data:ord.map(o=>Math.max(0,o.orden-o.desp)),backgroundColor:'#DC2626',stack:'a',borderRadius:4},
+      {label:'Despachado de más',data:ord.map(o=>Math.max(0,o.desp-o.orden)),backgroundColor:'#B7E0CE',stack:'a',borderRadius:4}]},
+    options:{indexAxis:'y',scales:{x:{stacked:true,beginAtZero:true,ticks:{callback:v=>n0(v)}},
+      y:{stacked:true,ticks:{font:{size:11}}}},
+      plugins:{tooltip:{callbacks:{
+        title:c=>{const o=ord[c[0].dataIndex];return o.g+' — ordenado '+n0(o.orden)+', despachado '+n0(o.desp);},
+        label:c=>c.parsed.x? c.dataset.label+': '+n0(c.parsed.x)+' prendas' : null}}}}});
+
+  /* --- concentración de la caída --- */
+  try{CH.caiMix&&CH.caiMix.destroy();}catch(e){}
+  const cm=document.getElementById('pnlCaiMix');
+  if(caidos0.length){
+    if(cm) cm.style.display='';
+    CH.caiMix=new Chart(document.getElementById('cCaiMix'),{type:'doughnut',
+      data:{labels:caidos0.map(o=>o.g+' · '+o.desc),
+        datasets:[{data:caidos0.map(o=>-o.dif),
+          backgroundColor:['#DC2626','#B45309','#F59E0B','#4E6B78','#5F726C','#0E3B36'],borderWidth:0}]},
+      options:{cutout:'62%',plugins:{legend:{position:'bottom',labels:{font:{size:11}}},
+        tooltip:{callbacks:{label:c=>n0(c.parsed)+' prendas ('+n1(c.parsed/caidaBruta*100)+'%)'}}}}});
+  } else if(cm) cm.style.display='none';
+
   const vac='<p style="color:var(--stone);margin:0">La matriz no tiene filas PENDIENTE para este período, así que aquí no hay nada que comparar: sin cantidad y fecha programadas no se puede medir caída ni puntualidad. El programa cargado corresponde a 2026.</p>';
   if(!all.length){['tblCum','tblEstiloCaida'].forEach(i=>document.getElementById(i).innerHTML=vac);
     document.getElementById('noteCum').innerHTML='';return;}
-  let h='<table><thead><tr><th>Grupo</th><th>Temporada</th><th>Estilo</th><th class="num">Programado</th><th class="num">Facturado</th><th class="num">Diferencia</th><th class="num">Cumpl.</th><th>F. programada</th><th class="num">En fecha</th><th class="num">Fuera de fecha</th><th class="num">Días de atraso</th><th>Estado</th></tr></thead><tbody>';
+  let h='<table><thead><tr><th>Grupo</th><th>Temporada</th><th>Estilo</th><th class="num">Orden estimada</th><th class="num">Despachado</th><th class="num">Diferencia</th><th class="num">% de despacho</th><th>F. programada</th><th class="num">En fecha</th><th class="num">Fuera de fecha</th><th class="num">Días de atraso</th><th>Estado</th></tr></thead><tbody>';
   all.forEach(o=>{
     if(!o.venc){
-      h+='<tr><td><b>'+o.g+'</b></td><td>'+o.t+'</td><td>'+o.estLbl+'</td><td class="num">'+n0(o.prog)+'</td>'+
+      h+='<tr><td><b>'+o.g+'</b></td><td>'+o.t+'</td><td>'+o.estLbl+'</td><td class="num">'+n0(o.orden)+'</td>'+
          '<td class="num">—</td><td class="num">—</td><td class="num">—</td><td>'+dmy(o.fprog)+'</td><td class="num">—</td><td class="num">—</td><td class="num">—</td>'+
          '<td><span class="pill neu">Programado, aún no vence</span></td></tr>'; return;
     }
@@ -892,7 +1539,8 @@ function renderCum(all,cum,progT,realT,caidaBruta){
     const est = o.dif<0? 'Caída de '+n0(-o.dif) : (o.dif>0?'Embarcó de más':'Exacto');
     const dcls = !o.qTarde?'ok':(o.diasTarde<=7?'warn':'bad');
     h+='<tr><td><b>'+o.g+'</b></td><td>'+o.t+'</td><td>'+o.estLbl+'</td>'+
-       '<td class="num">'+n0(o.prog)+'</td><td class="num">'+n0(o.real)+'</td>'+
+       '<td class="num">'+n0(o.orden)+(o.antes?'<br><span class="sub2">'+n0(o.antes)+' antes del programa</span>':'')+'</td>'+
+       '<td class="num">'+n0(o.desp)+'</td>'+
        '<td class="num" style="color:'+(o.dif<0?'var(--rose)':(o.dif>0?'var(--sage)':'inherit'))+'">'+(o.dif>0?'+':'')+n0(o.dif)+'</td>'+
        '<td class="num">'+n1(p)+'%</td><td>'+dmy(o.fprog)+'</td>'+
        '<td class="num">'+n0(o.qOk)+'</td>'+
@@ -907,9 +1555,9 @@ function renderCum(all,cum,progT,realT,caidaBruta){
      '<td class="num">'+n0(all.filter(o=>o.venc).reduce((s,o)=>s+o.qTarde,0))+'</td><td colspan="2"></td></tr></tfoot></table>';
   document.getElementById('tblCum').innerHTML=h;
   document.getElementById('noteCum').innerHTML=
-    '<b>Caída bruta '+n0(caidaBruta)+' prendas</b> ('+n1(caidaBruta/progT*100)+'% de lo programado) contra <b>caída neta '+n0(progT-realT)+'</b>. '+
-    'La diferencia son '+n0(excedente)+' prendas embarcadas de más en otros grupos, que compensan en el total pero no reponen el estilo que faltó. '+
-    'Los porcentajes se calculan sobre la suma de prendas programadas, no promediando los porcentajes de cada grupo.';
+    '<b>Caída bruta '+n0(caidaBruta)+' prendas</b> ('+n1(caidaBruta/progT*100)+'% de lo ordenado) contra <b>caída neta '+n0(progT-realT)+'</b>. '+
+    'La diferencia son '+n0(excedente)+' prendas despachadas de más en otros grupos, que compensan en el total pero no reponen el estilo que faltó. '+
+    'Los porcentajes se calculan sobre la suma de prendas ordenadas, no promediando los porcentajes de cada grupo.';
 
   const v=all.filter(o=>o.venc);
   CH.desv=new Chart(document.getElementById('cDesv'),{type:'bar',
@@ -987,23 +1635,75 @@ function grupos(A,comp){
     return g;
   }).sort((a,b)=>a.ini<b.ini?-1:(a.ini>b.ini?1:0));
 }
+/* ----- multiselector de grupos ----- */
+let SEL_G=new Set(), MS_LISTA=[], MS_TOCADO=false;
+function msToggle(ev){ ev.stopPropagation();
+  const m=document.getElementById('msGrupo');
+  m.classList.toggle('abierto');
+  if(m.classList.contains('abierto')){ msPintar(); const b=document.getElementById('msBuscar'); if(b){b.value='';b.focus();} }
+}
+function msCerrar(){ const m=document.getElementById('msGrupo'); if(m) m.classList.remove('abierto'); }
+document.addEventListener('click',e=>{
+  const m=document.getElementById('msGrupo');
+  if(m && m.classList.contains('abierto') && !m.contains(e.target)) m.classList.remove('abierto');
+});
+function msTodos(v){
+  MS_TOCADO=true;
+  const be=document.getElementById('msBuscar');
+  const q=((be&&be.value)||'').trim().toUpperCase();
+  const vis=MS_LISTA.filter(x=>!q||x.g.toUpperCase().indexOf(q)>=0||String(x.t).toUpperCase().indexOf(q)>=0);
+  vis.forEach(x=>{ v? SEL_G.add(x.g) : SEL_G.delete(x.g); });
+  msPintar(); renderGrupos();
+}
+function msMarcar(g){
+  MS_TOCADO=true;
+  SEL_G.has(g)? SEL_G.delete(g) : SEL_G.add(g);
+  msPintar(); renderGrupos();
+}
+function msActivos(){ return (SEL_G.size===MS_LISTA.length)? null : SEL_G; }
+function msPintar(){
+  const lst=document.getElementById('msList'); if(!lst) return;
+  const be=document.getElementById('msBuscar');
+  const q=((be&&be.value)||'').trim().toUpperCase();
+  const vis=MS_LISTA.filter(x=>!q||x.g.toUpperCase().indexOf(q)>=0||String(x.t).toUpperCase().indexOf(q)>=0);
+  lst.innerHTML = vis.length? vis.map(x=>
+    '<label class="ms-op"><input type="checkbox" '+(SEL_G.has(x.g)?'checked':'')+
+    ' onchange="msMarcar(\''+x.g+'\')"><span class="pt2" style="background:'+
+    (x.tarde?'#DC2626':'#0F7A5A')+'"></span><span class="g">'+x.g+'</span>'+
+    '<span class="q">'+n0(x.q)+'</span></label>').join('')
+    : '<div class="ms-vacio">Ningún grupo coincide con la búsqueda.</div>';
+  const n=SEL_G.size, tot=MS_LISTA.length;
+  const lab=document.getElementById('msLabel');
+  if(lab) lab.textContent = (n===tot||n===0&&tot===0)? 'Todos los grupos'
+      : (n===0? 'Ningún grupo' : (n===1? [...SEL_G][0] : n+' grupos seleccionados'));
+  const pie=document.getElementById('msPie');
+  if(pie) pie.textContent = n+' de '+tot+' grupos';
+}
 function opciones(sel,lista,todos){
   const e=document.getElementById(sel); if(!e) return;
   const ant=e.value;
   e.innerHTML='<option value="">'+todos+'</option>'+lista.map(x=>'<option value="'+x+'">'+x+'</option>').join('');
   if(lista.indexOf(ant)>=0) e.value=ant;
 }
-function limpiarFiltros(){['fGrupo','fTemp','fEstado'].forEach(i=>{const e=document.getElementById(i);if(e)e.value='';});renderGrupos();}
+function limpiarFiltros(){
+  MS_TOCADO=false; SEL_G=new Set(MS_LISTA.map(x=>x.g));
+  ['fTemp','fEstado','msBuscar'].forEach(i=>{const e=document.getElementById(i);if(e)e.value='';});
+  msCerrar(); renderGrupos();
+}
 function renderGrupos(A,comp){
   if(A!==undefined){GRP_A=A;GRP_COMP=comp;}
   A=GRP_A; comp=GRP_COMP;
   const todos=grupos(A,comp);
-  opciones('fGrupo',todos.map(g=>g.g).sort(),'Todos los grupos');
+  MS_LISTA=todos.map(g=>({g:g.g,q:g.q,t:g.t,tarde:g.tarde>0}));
+  const validos=new Set(MS_LISTA.map(x=>x.g));
+  if(!MS_TOCADO){ SEL_G=new Set(validos); }
+  else { [...SEL_G].forEach(g=>{ if(!validos.has(g)) SEL_G.delete(g); }); }
+  msPintar();
   opciones('fTemp',[...new Set(todos.map(g=>g.t))].sort(),'Todas las temporadas');
-  const fg=(document.getElementById('fGrupo')||{}).value||'';
+  const sel=msActivos();
   const ft=(document.getElementById('fTemp')||{}).value||'';
   const fe=(document.getElementById('fEstado')||{}).value||'';
-  let L=todos.filter(g=>(!fg||g.g===fg)&&(!ft||g.t===ft)&&
+  let L=todos.filter(g=>(!sel||sel.has(g.g))&&(!ft||g.t===ft)&&
     (!fe || (fe==='ok'&&g.tarde===0) || (fe==='tarde'&&g.tarde>0) || (fe==='rep'&&g.rep>0)));
 
   const TQ=todos.reduce((s,g)=>s+g.q,0)||1;
@@ -1011,8 +1711,11 @@ function renderGrupos(A,comp){
         tarde=L.reduce((s,g)=>s+g.tarde,0), rep=L.reduce((s,g)=>s+g.rep,0),
         v=L.reduce((s,g)=>s+g.v,0);
   const pct=q?ok/q*100:0;
-  const filtrado = !!(fg||ft||fe);
+  const filtrado = !!(sel||ft||fe);
 
+  const fr=document.getElementById('fResumen');
+  if(fr) fr.textContent = filtrado? (L.length+' de '+todos.length+' grupos · '+n0(q)+' prendas · '+n1(pct)+'% a tiempo')
+                                  : (todos.length+' grupos · '+n0(q)+' prendas');
   document.getElementById('resGrupo').innerHTML=
     '<div class="big3" style="margin-bottom:14px">'+
     '<div class="b3"><div class="l">Grupos despachados</div><div class="v">'+L.length+'</div>'+
@@ -1219,7 +1922,7 @@ function renderGaps(){}
 
 /* ---------- UI ---------- */
 function buildTabs(){
-  const names=['Resumen ejecutivo','Evolución','Despacho a tiempo','Mix y precios','Proyección'];
+  const names=['Resumen ejecutivo','Evolución','Despachos','Mix y precios','Proyección'];
   if(!OBS) names.push('Notas'+' internas');
   document.getElementById('tabs').innerHTML=names.map((n,i)=>
     '<button class="'+(i===0?'active':'')+(i===5?' solo-interna':'')+'" onclick="tab('+i+',this)">'+n+'</button>').join('');
@@ -1238,7 +1941,7 @@ function buildSeg(){
   const i=AS.indexOf(+ANIO); (bs[i>=0?i:bs.length-1]).classList.add('active');
 }
 function setPlan(v,b){PLAN=v;document.querySelectorAll('#segCierre button').forEach(x=>x.classList.remove('active'));b.classList.add('active');render();}
-function setAnio(a,b){ANIO=a;document.querySelectorAll('#segAnio button').forEach(x=>x.classList.remove('active'));b.classList.add('active');render();}
+function setAnio(a,b){ANIO=a;MS_TOCADO=false;SEL_G.clear();document.querySelectorAll('#segAnio button').forEach(x=>x.classList.remove('active'));b.classList.add('active');render();}
 /* ---------- CARGA DE EXCEL ---------- */
 function err(m){const e=document.getElementById('err');e.style.display='block';e.textContent=m;setTimeout(()=>e.style.display='none',9000);}
 const norm=s=>String(s==null?'':s).trim();
